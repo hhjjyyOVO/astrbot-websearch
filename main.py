@@ -8,10 +8,15 @@ AstrBot Web Search 插件 — 百度 + Bing 双引擎网页搜索 + 详情爬取
 import re
 import time
 import urllib.parse
+import ssl
 from html import unescape
 
 import requests
 from bs4 import BeautifulSoup
+import urllib3
+
+# 禁用 SSL 警告
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
@@ -25,6 +30,7 @@ class WebSearchPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self.session = requests.Session()
+        self.session.verify = False
         self.session.headers.update({
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
