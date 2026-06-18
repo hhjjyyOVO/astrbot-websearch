@@ -197,10 +197,7 @@ class WebSearchPlugin(Star):
         results = bing + baidu[:(5 - len(bing))] if bing else baidu
 
         if not results:
-            yield event.plain_result(
-                "未找到相关搜索结果，请如实告知用户未找到，建议更具体的关键词。"
-            )
-            return
+            return "未找到相关搜索结果，请如实告知用户未找到，建议更具体的关键词。"
 
         self._cache[uid] = {
             "results": results, "time": time.time(), "query": query,
@@ -231,8 +228,9 @@ class WebSearchPlugin(Star):
         max_chars = self._cfg.get("reply_max_chars", 200)
         show_src = self._cfg.get("show_source", False)
         src_rule = "可以附带来源链接" if show_src else "不要列出网址或来源"
-        yield event.plain_result(
-            f"以下是与「{query}」相关的搜索结果。请用不超过{max_chars}字的自然对话语气回答用户，{src_rule}：\n\n{context}"
+        return (
+            f"以下是与「{query}」相关的搜索结果。"
+            f"请用不超过{max_chars}字的自然对话语气回答用户，{src_rule}：\n\n{context}"
         )
 
     # ── 手动指令 ──────────────────────────
@@ -242,16 +240,18 @@ class WebSearchPlugin(Star):
         if not query:
             yield event.plain_result("用法: /search <关键词>")
             return
-        async for r in self.search_web(event, query):
-            yield r
+        result = await self.search_web(event, query)
+        if isinstance(result, str):
+            yield event.plain_result(result)
 
     @filter.command("网页搜索")
     async def cmd_search_cn(self, event: AstrMessageEvent, query: str = ""):
         if not query:
             yield event.plain_result("用法: /网页搜索 <关键词>")
             return
-        async for r in self.search_web(event, query):
-            yield r
+        result = await self.search_web(event, query)
+        if isinstance(result, str):
+            yield event.plain_result(result)
 
     # ── 详情 ──────────────────────────────
 
