@@ -31,25 +31,29 @@ SEARCH_SYSTEM_PROMPT = """你是一个友好、专业的助手。请根据以下
 - 使用中文回复"""
 
 
-# ── 嵌入模型（可选 sentence-transformers）───
-_embedding_model = None
+# ── 嵌入适配器（优先用 AstrBot 配置的模型）───
+_embed_adapter = None
 
 
-def _get_embedding_model():
-    """延迟加载嵌入模型，失败则用关键词匹配"""
-    global _embedding_model
-    if _embedding_model is not None:
-        return _embedding_model
+def _get_embed_adapter(context: Context = None):
+    """获取 AstrBot 配置的 embedding 模型，不可用时回退关键词匹配"""
+    global _embed_adapter
+    if _embed_adapter is not None:
+        return _embed_adapter
+    if context is None:
+        _embed_adapter = False
+        return _embed_adapter
     try:
-        from sentence_transformers import SentenceTransformer
-        _embedding_model = SentenceTransformer(
-            "sentence-transformers/all-MiniLM-L6-v2"
-        )
-        logger.info("嵌入模型已加载: all-MiniLM-L6-v2")
-    except Exception:
-        _embedding_model = False
-        logger.info("嵌入模型不可用，使用关键词匹配")
-    return _embedding_model
+        star = context.get_registered_star("astrbot_plugin_embedding_adapter")
+        if star and hasattr(star.star_cls, "get_embeddings"):
+            _embed_adapter = star.star_cls
+            logger.info(f"使用 AstrBot 嵌入模型: {_embed_adapter.get_model_name()}")
+            return _embed_adapter
+    except Exception as e:
+        logger.warning(f"嵌入适配器未就绪: {e}")
+    _embed_adapter = False
+    logger.info("嵌入模型不可用，使用关键词匹配")
+    return _embed_adapter
 
 
 # ── 中文分词 ──────────────────────────────
@@ -75,7 +79,8 @@ def _jaccard(a: set, b: set) -> float:
 
 # ── 内容整理 ──────────────────────────────
 
-def _extract_relevant_passages(query: str, pages: list, max_chars: int = 3500) -> str:
+def _extract_relevant_passages(query: str, pages: list, max_chars: int = 3500,
+                               adapter=None) -> str:
     """从多个网页中提取与查询最相关的段落"""
     query_tokens = _tokenize(query)
 
@@ -93,21 +98,21 @@ def _extract_relevant_passages(query: str, pages: list, max_chars: int = 3500) -
     if not all_paragraphs:
         return ""
 
-    # 用嵌入模型或关键词匹配打分
-    model = _get_embedding_model()
-    if model:
+    # 优先用 AstrBot 嵌入模型，不可用时用关键词匹配
+    para_texts = [p["text"] for p in all_paragraphs]
+    if adapter:
         try:
-            query_emb = model.encode([query])[0]
-            para_texts = [p["text"] for p in all_paragraphs]
-            para_embs = model.encode(para_texts)
+            all_texts = [query] + para_texts
+            embeddings = adapter.get_embeddings(all_texts)
+            query_emb = embeddings[0]
             from numpy import dot
             from numpy.linalg import norm
-            scores = [dot(query_emb, pe) / (norm(query_emb) * norm(pe))
-                      for pe in para_embs]
+            scores = [dot(query_emb, e) / (norm(query_emb) * norm(e))
+                      for e in embeddings[1:]]
         except Exception:
-            model = False  # 嵌入失败，回退关键词
+            adapter = None
 
-    if not model:
+    if not adapter:
         para_tokens = [_tokenize(p["text"]) for p in all_paragraphs]
         scores = [_jaccard(query_tokens, pt) for pt in para_tokens]
 
@@ -181,8 +186,8 @@ class WebSearchPlugin(Star):
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         })
         self._cache: dict = {}
-        _get_embedding_model()  # 启动时预热嵌入模型
-        logger.info("WebSearch 插件已加载 (嵌入整理 + LLM生成)")
+        self._adapter = _get_embed_adapter(context)
+        logger.info("WebSearch 插件已加载 (AstrBot嵌入 + LLM生成)")
 
     # ── LLM 工具 ───────────────────────────
 
@@ -223,7 +228,7 @@ class WebSearchPlugin(Star):
 
         # 3. 嵌入/关键词整理相关内容
         if pages:
-            context = _extract_relevant_passages(query, pages)
+            context = _extract_relevant_passages(query, pages, adapter=self._adapter)
         else:
             # 无全文时用搜索摘要
             context = "\n\n".join(
@@ -297,7 +302,7 @@ class WebSearchPlugin(Star):
 
         context = _extract_relevant_passages(cache["query"], [{
             "title": t["title"], "url": t["href"], "text": text,
-        }])
+        }], adapter=self._adapter)
         yield event.plain_result(
             f"{SEARCH_SYSTEM_PROMPT}\n\n"
             f"用户想详细了解第{idx+1}条搜索结果，请总结要点:\n\n{context}"
