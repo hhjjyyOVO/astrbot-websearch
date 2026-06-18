@@ -1,10 +1,7 @@
 """
-AstrBot Web Search 插件 — LLM 驱动的网页搜索
-搜索结果注入对话上下文，由大模型生成自然回复，不在回复中显示网址。
-用法:
-  直接提问（LLM 自动调用搜索工具）
-  /search <关键词>        手动触发搜索
-  /detail <序号>          查看网页全文（LLM 总结）
+AstrBot Web Search 插件 — 搜索 + 嵌入整理 + LLM 生成回复
+
+流程: 搜索 → 爬取网页全文 → 嵌入模型/关键词 提取相关内容 → LLM 按 system prompt 生成自然回复
 """
 import re
 import time
@@ -20,10 +17,155 @@ from astrbot.api import logger
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-CACHE_TTL = 300  # 搜索结果缓存秒数
+CACHE_TTL = 300
+
+# ── System Prompt ──────────────────────────
+SEARCH_SYSTEM_PROMPT = """你是一个友好、专业的助手。请根据以下来自互联网的最新信息回答用户问题。
+
+规则:
+- 用自然的对话语气回复，像朋友聊天一样，不要使用列表格式
+- 综合多条信息给出完整答案，不要逐条罗列
+- 绝对不要在回复中显示任何网址链接
+- 如果信息不足以回答，诚实说明并建议用户提供更具体的问题
+- 回复简洁，控制在 300 字以内
+- 使用中文回复"""
 
 
-@register("websearch", "hhjjyy", "LLM驱动的网页搜索插件", "2.0.0")
+# ── 嵌入模型（可选 sentence-transformers）───
+_embedding_model = None
+
+
+def _get_embedding_model():
+    """延迟加载嵌入模型，失败则用关键词匹配"""
+    global _embedding_model
+    if _embedding_model is not None:
+        return _embedding_model
+    try:
+        from sentence_transformers import SentenceTransformer
+        _embedding_model = SentenceTransformer(
+            "sentence-transformers/all-MiniLM-L6-v2"
+        )
+        logger.info("嵌入模型已加载: all-MiniLM-L6-v2")
+    except Exception:
+        _embedding_model = False
+        logger.info("嵌入模型不可用，使用关键词匹配")
+    return _embedding_model
+
+
+# ── 中文分词 ──────────────────────────────
+
+def _tokenize(text: str) -> set:
+    """中文 bigram + 英文单词 分词"""
+    tokens = set()
+    cleaned = re.sub(r'[^一-鿿\w]', ' ', text.lower())
+    for i in range(len(cleaned) - 1):
+        bigram = cleaned[i:i+2]
+        if len(bigram) == 2 and '一' <= bigram[0] <= '鿿' and '一' <= bigram[1] <= '鿿':
+            tokens.add(bigram)
+    for w in re.findall(r'[a-zA-Z]{2,}', cleaned):
+        tokens.add(w)
+    return tokens
+
+
+def _jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+# ── 内容整理 ──────────────────────────────
+
+def _extract_relevant_passages(query: str, pages: list, max_chars: int = 3500) -> str:
+    """从多个网页中提取与查询最相关的段落"""
+    query_tokens = _tokenize(query)
+
+    # 每页分段
+    all_paragraphs = []
+    for page in pages:
+        paras = [p.strip() for p in page["text"].split("\n") if len(p.strip()) > 20]
+        for p in paras:
+            all_paragraphs.append({
+                "text": p,
+                "source": page["title"],
+                "url": page["url"],
+            })
+
+    if not all_paragraphs:
+        return ""
+
+    # 用嵌入模型或关键词匹配打分
+    model = _get_embedding_model()
+    if model:
+        try:
+            query_emb = model.encode([query])[0]
+            para_texts = [p["text"] for p in all_paragraphs]
+            para_embs = model.encode(para_texts)
+            from numpy import dot
+            from numpy.linalg import norm
+            scores = [dot(query_emb, pe) / (norm(query_emb) * norm(pe))
+                      for pe in para_embs]
+        except Exception:
+            model = False  # 嵌入失败，回退关键词
+
+    if not model:
+        para_tokens = [_tokenize(p["text"]) for p in all_paragraphs]
+        scores = [_jaccard(query_tokens, pt) for pt in para_tokens]
+
+    # 按分数排序
+    for i, p in enumerate(all_paragraphs):
+        p["score"] = scores[i]
+    all_paragraphs.sort(key=lambda x: x["score"], reverse=True)
+
+    # 取高分段落，直到达到字数上限
+    seen = set()
+    parts = []
+    total = 0
+    for p in all_paragraphs:
+        if p["score"] < 0.02:
+            break
+        key = p["text"][:50]
+        if key in seen:
+            continue
+        seen.add(key)
+        parts.append(f"[来源: {p['source']}]\n{p['text']}")
+        total += len(p['text'])
+        if total >= max_chars:
+            break
+
+    logger.info(f"内容整理: {len(all_paragraphs)}段 → {len(parts)}段 ({total}字)")
+    return "\n\n".join(parts)
+
+
+def _fetch_page(url: str, session: requests.Session) -> str:
+    try:
+        resp = session.get(url, timeout=12)
+        resp.encoding = resp.apparent_encoding or "utf-8"
+        if resp.status_code != 200:
+            return ""
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for tag in soup.select(
+            "script, style, nav, footer, header, aside, "
+            "iframe, noscript, .sidebar, .ad, .nav, .footer, .header, .menu"
+        ):
+            tag.decompose()
+        body = (
+            soup.find("article") or soup.find("main") or
+            soup.find(class_=re.compile(r"content|article|post|entry|body", re.I)) or
+            soup.body
+        )
+        if not body:
+            return ""
+        text = body.get_text(separator="\n", strip=True)
+        text = unescape(text)
+        return re.sub(r'\n{3,}', '\n\n', text)
+    except Exception as e:
+        logger.warning(f"爬取失败 {url}: {e}")
+        return ""
+
+
+# ═══════════════════════════════════════════
+
+@register("websearch", "hhjjyy", "LLM驱动的网页搜索插件(嵌入整理)", "2.1.0")
 class WebSearchPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -39,18 +181,22 @@ class WebSearchPlugin(Star):
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         })
         self._cache: dict = {}
-        logger.info("WebSearch 插件已加载 (LLM驱动)")
+        _get_embedding_model()  # 启动时预热嵌入模型
+        logger.info("WebSearch 插件已加载 (嵌入整理 + LLM生成)")
 
-    # ── LLM 工具：自动被大模型调用 ──────────
+    # ── LLM 工具 ───────────────────────────
 
     @filter.llm_tool(name="search_web")
     async def search_web(self, event: AstrMessageEvent, query: str):
-        """搜索互联网获取实时信息。当需要了解最新新闻、实时数据、或知识库外的公开信息时调用。
+        """搜索互联网获取实时信息，自动爬取网页全文并提取相关内容。
+        当需要了解新闻、实时数据、或知识库外的公开信息时调用。
 
         Args:
-            query(string): 搜索关键词，用简洁的词组描述要查找的内容
+            query(string): 搜索关键词
         """
         uid = event.unified_msg_origin
+
+        # 1. 搜索
         bing = self._search_bing(query, 3)
         baidu = self._search_baidu(query, 3)
         results = bing + baidu[:(5 - len(bing))] if bing else baidu
@@ -59,30 +205,45 @@ class WebSearchPlugin(Star):
             yield event.plain_result(f"未找到与「{query}」相关的搜索结果。")
             return
 
-        # 缓存（供后续 /detail 使用）
         self._cache[uid] = {
             "results": results, "time": time.time(), "query": query,
         }
 
-        # 返回搜索结果（会被注入 LLM 上下文，由 LLM 生成自然回复）
-        lines = [f"以下是与「{query}」相关的搜索结果："]
+        # 2. 爬取网页全文
+        pages = []
+        for r in results[:3]:
+            text = _fetch_page(r["href"], self.session)
+            if text:
+                pages.append({
+                    "title": r["title"],
+                    "url": r["href"],
+                    "text": text[:5000],
+                })
+        logger.info(f"爬取完成: {len(pages)}/{min(3, len(results))} 页")
 
-        for i, r in enumerate(results, 1):
-            title = r.get("title", "无标题")
-            body = r.get("body", "")
-            lines.append(
-                f"[{i}] {title}\n"
-                f"    摘要: {body}\n"
-                f"    来源: {r.get('href', '')}"
+        # 3. 嵌入/关键词整理相关内容
+        if pages:
+            context = _extract_relevant_passages(query, pages)
+        else:
+            # 无全文时用搜索摘要
+            context = "\n\n".join(
+                f"[{i+1}] {r['title']}\n{r['body']}"
+                for i, r in enumerate(results[:5])
             )
 
-        yield event.plain_result("\n\n".join(lines))
+        # 4. 组装系统提示 + 上下文
+        reply = (
+            f"{SEARCH_SYSTEM_PROMPT}\n\n"
+            f"用户问题: {query}\n\n"
+            f"参考信息:\n{context}\n\n"
+            f"请根据以上信息回答用户问题。"
+        )
+        yield event.plain_result(reply)
 
-    # ── 手动搜索指令 ──────────────────────
+    # ── 手动指令 ──────────────────────────
 
     @filter.command("search")
     async def cmd_search(self, event: AstrMessageEvent, query: str = ""):
-        """手动搜索 — /search <关键词>"""
         if not query:
             yield event.plain_result("用法: /search <关键词>")
             return
@@ -97,61 +258,52 @@ class WebSearchPlugin(Star):
         async for r in self.search_web(event, query):
             yield r
 
-    # ── 详情查看（也走 LLM）───────────────
+    # ── 详情 ──────────────────────────────
 
     @filter.command("detail")
     async def cmd_detail(self, event: AstrMessageEvent, index: str = ""):
-        """查看搜索结果全文，由 LLM 总结 — /detail <序号>"""
-        await self._handle_detail(event, index)
+        await self._do_detail(event, index)
 
     @filter.command("详情")
     async def cmd_detail_cn(self, event: AstrMessageEvent, index: str = ""):
-        await self._handle_detail(event, index)
+        await self._do_detail(event, index)
 
     @filter.regex(r"(?:详细)?看(?:看|下|一下)?第?\s*(\d+)\s*(?:条|个|篇|项)")
-    async def on_detail_natural(self, event: AstrMessageEvent):
-        msg = event.get_message_str()
-        m = re.search(r"第?\s*(\d+)\s*(?:条|个|篇|项)", msg)
+    async def on_detail(self, event: AstrMessageEvent):
+        m = re.search(r"第?\s*(\d+)\s*(?:条|个|篇|项)", event.get_message_str())
         if m:
-            await self._handle_detail(event, m.group(1))
+            await self._do_detail(event, m.group(1))
 
-    async def _handle_detail(self, event: AstrMessageEvent, index: str):
+    async def _do_detail(self, event: AstrMessageEvent, index: str):
         uid = event.unified_msg_origin
         cache = self._cache.get(uid)
-
         if not cache or time.time() - cache["time"] > CACHE_TTL:
             yield event.plain_result("没有最近的搜索结果，请先提问让我搜索。")
             return
-
         try:
             idx = int(index) - 1
         except ValueError:
-            yield event.plain_result(f"请输入有效序号（1-{len(cache['results'])}）")
+            yield event.plain_result(f"序号范围 1-{len(cache['results'])}")
             return
-
         if idx < 0 or idx >= len(cache["results"]):
-            yield event.plain_result(f"序号超出范围（1-{len(cache['results'])}）")
+            yield event.plain_result(f"序号范围 1-{len(cache['results'])}")
             return
 
-        target = cache["results"][idx]
-        url = target["href"]
-        title = target["title"]
-
-        content = self._fetch_page(url)
-        if not content:
-            yield event.plain_result(f"无法获取网页内容。如需查看原文，请访问: {url}")
+        t = cache["results"][idx]
+        text = _fetch_page(t["href"], self.session)
+        if not text:
+            yield event.plain_result(f"无法获取网页内容。原文: {t['href']}")
             return
 
-        # 注入 LLM 上下文让其总结
-        article = (
-            f"用户要求查看以下网页的详细内容。请用中文简洁总结要点（200字以内），"
-            f"不要列出网址，用自然的对话语气回复：\n\n"
-            f"标题: {title}\n"
-            f"正文:\n{content[:4000]}"
+        context = _extract_relevant_passages(cache["query"], [{
+            "title": t["title"], "url": t["href"], "text": text,
+        }])
+        yield event.plain_result(
+            f"{SEARCH_SYSTEM_PROMPT}\n\n"
+            f"用户想详细了解第{idx+1}条搜索结果，请总结要点:\n\n{context}"
         )
-        yield event.plain_result(article)
 
-    # ── 核心搜索 ──────────────────────────
+    # ── 搜索引擎 ──────────────────────────
 
     def _search_bing(self, query: str, n: int = 3) -> list:
         results = []
@@ -164,16 +316,15 @@ class WebSearchPlugin(Star):
             for item in soup.select("li.b_algo"):
                 if len(results) >= n:
                     break
-                title_tag = item.select_one("h2 a")
-                if not title_tag:
+                t = item.select_one("h2 a")
+                if not t:
                     continue
-                snippet_tag = item.select_one("div.b_caption p, p.b_lineclamp2")
+                s = item.select_one("div.b_caption p, p.b_lineclamp2")
                 results.append({
-                    "title": title_tag.get_text(strip=True),
-                    "href": title_tag.get("href", ""),
-                    "body": snippet_tag.get_text(strip=True) if snippet_tag else "",
+                    "title": t.get_text(strip=True),
+                    "href": t.get("href", ""),
+                    "body": s.get_text(strip=True) if s else "",
                 })
-            logger.info(f"Bing: {len(results)} 条 → {query}")
         except Exception as e:
             logger.warning(f"Bing 失败: {e}")
         return results
@@ -187,51 +338,21 @@ class WebSearchPlugin(Star):
             if resp.status_code != 200:
                 return results
             soup = BeautifulSoup(resp.text, "html.parser")
-            for container in soup.select("div.result, div.c-container"):
+            for c in soup.select("div.result, div.c-container"):
                 if len(results) >= n:
                     break
-                title_tag = container.select_one("h3 a")
-                if not title_tag:
+                t = c.select_one("h3 a")
+                if not t:
                     continue
-                abstract_tag = container.select_one(
-                    "span.content-right_8Zs40, span.content, div.c-abstract"
-                )
+                a = c.select_one("span.content-right_8Zs40, span.content, div.c-abstract")
                 results.append({
-                    "title": title_tag.get_text(strip=True),
-                    "href": title_tag.get("href", ""),
-                    "body": abstract_tag.get_text(strip=True) if abstract_tag else "",
+                    "title": t.get_text(strip=True),
+                    "href": t.get("href", ""),
+                    "body": a.get_text(strip=True) if a else "",
                 })
-            logger.info(f"百度: {len(results)} 条 → {query}")
         except Exception as e:
             logger.warning(f"百度失败: {e}")
         return results
-
-    def _fetch_page(self, url: str) -> str:
-        try:
-            resp = self.session.get(url, timeout=12)
-            resp.encoding = resp.apparent_encoding or "utf-8"
-            if resp.status_code != 200:
-                return ""
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for tag in soup.select(
-                "script, style, nav, footer, header, aside, "
-                "iframe, noscript, .sidebar, .ad, .nav, .footer, .header"
-            ):
-                tag.decompose()
-            body = (
-                soup.find("article") or soup.find("main") or
-                soup.find(class_=re.compile(r"content|article|post|entry|body", re.I)) or
-                soup.body
-            )
-            if not body:
-                return ""
-            text = body.get_text(separator="\n", strip=True)
-            text = unescape(text)
-            text = re.sub(r'\n{3,}', '\n\n', text)
-            return text[:6000] if len(text) > 6000 else text
-        except Exception as e:
-            logger.error(f"爬取失败 {url}: {e}")
-            return ""
 
     async def terminate(self):
         self._cache.clear()
