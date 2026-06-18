@@ -1,0 +1,5 @@
+name: websearch
+author: hhjjyy
+desc: 百度 + Bing 双引擎网页搜索插件，Bing 优先，国内可用
+version: "1.0.0"
+repo: https://github.com/hhjjyyOVO/hzau-agent
