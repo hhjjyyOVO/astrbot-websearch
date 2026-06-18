@@ -19,16 +19,6 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 CACHE_TTL = 300
 
-# ── System Prompt ──────────────────────────
-SEARCH_SYSTEM_PROMPT = """你是一个友好、专业的助手。请根据以下来自互联网的最新信息回答用户问题。
-
-规则:
-- 用自然的对话语气回复，像朋友聊天一样，不要使用列表格式
-- 综合多条信息给出完整答案，不要逐条罗列
-- 绝对不要在回复中显示任何网址链接
-- 如果信息不足以回答，诚实说明并建议用户提供更具体的问题
-- 回复简洁，控制在 300 字以内
-- 使用中文回复"""
 
 
 # ── 嵌入适配器（优先用 AstrBot 配置的模型）───
@@ -236,14 +226,10 @@ class WebSearchPlugin(Star):
                 for i, r in enumerate(results[:5])
             )
 
-        # 4. 组装系统提示 + 上下文
-        reply = (
-            f"{SEARCH_SYSTEM_PROMPT}\n\n"
-            f"用户问题: {query}\n\n"
-            f"参考信息:\n{context}\n\n"
-            f"请根据以上信息回答用户问题。"
+        # 4. 返回搜索结果（LLM 会自动根据此信息生成回复）
+        yield event.plain_result(
+            f"关于「{query}」的搜索结果：\n\n{context}"
         )
-        yield event.plain_result(reply)
 
     # ── 手动指令 ──────────────────────────
 
@@ -304,8 +290,7 @@ class WebSearchPlugin(Star):
             "title": t["title"], "url": t["href"], "text": text,
         }], adapter=self._adapter)
         yield event.plain_result(
-            f"{SEARCH_SYSTEM_PROMPT}\n\n"
-            f"用户想详细了解第{idx+1}条搜索结果，请总结要点:\n\n{context}"
+            f"用户想查看第{idx+1}条结果的详细内容：\n\n{context}"
         )
 
     # ── 搜索引擎 ──────────────────────────
