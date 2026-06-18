@@ -13,7 +13,7 @@ from bs4 import BeautifulSoup
 import urllib3
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
+from astrbot.api import logger, AstrBotConfig
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -162,8 +162,9 @@ def _fetch_page(url: str, session: requests.Session) -> str:
 
 @register("websearch", "hhjjyy", "LLM驱动的网页搜索插件(嵌入整理)", "2.1.0")
 class WebSearchPlugin(Star):
-    def __init__(self, context: Context):
-        super().__init__(context)
+    def __init__(self, context: Context, config: AstrBotConfig = None):
+        super().__init__(context, config=config)
+        self._cfg = config or {}
         self.session = requests.Session()
         self.session.verify = False
         self.session.headers.update({
@@ -226,9 +227,12 @@ class WebSearchPlugin(Star):
                 for i, r in enumerate(results[:5])
             )
 
-        # 4. 返回搜索结果给LLM，并指示压缩回复
+        # 4. 返回搜索结果给LLM，按配置控制回复
+        max_chars = self._cfg.get("reply_max_chars", 200)
+        show_src = self._cfg.get("show_source", False)
+        src_rule = "可以附带来源链接" if show_src else "不要列出网址或来源"
         yield event.plain_result(
-            f"以下是与「{query}」相关的搜索结果。请用不超过200字的自然对话语气回答用户，不要列出网址或来源：\n\n{context}"
+            f"以下是与「{query}」相关的搜索结果。请用不超过{max_chars}字的自然对话语气回答用户，{src_rule}：\n\n{context}"
         )
 
     # ── 手动指令 ──────────────────────────

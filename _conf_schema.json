@@ -1,0 +1,14 @@
+{
+  "reply_max_chars": {
+    "description": "回复字数上限",
+    "type": "int",
+    "default": 200,
+    "hint": "LLM生成回复的最大字数，超过将压缩"
+  },
+  "show_source": {
+    "description": "显示来源网址",
+    "type": "bool",
+    "default": false,
+    "hint": "是否在回复中附带信息来源链接"
+  }
+}
