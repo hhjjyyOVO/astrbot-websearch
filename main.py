@@ -183,8 +183,7 @@ class WebSearchPlugin(Star):
 
     @filter.llm_tool(name="search_web")
     async def search_web(self, event: AstrMessageEvent, query: str):
-        """搜索互联网获取实时信息，自动爬取网页全文并提取相关内容。
-        当需要了解新闻、实时数据、或知识库外的公开信息时调用。
+        """搜索互联网获取最新信息。当用户询问新闻、天气、实时事件或任何需要联网查询的问题时，必须调用此工具。
 
         Args:
             query(string): 搜索关键词
@@ -197,7 +196,9 @@ class WebSearchPlugin(Star):
         results = bing + baidu[:(5 - len(bing))] if bing else baidu
 
         if not results:
-            yield event.plain_result(f"未找到与「{query}」相关的搜索结果。")
+            yield event.plain_result(
+                "未找到相关搜索结果，请如实告知用户未找到，建议更具体的关键词。"
+            )
             return
 
         self._cache[uid] = {
@@ -212,23 +213,22 @@ class WebSearchPlugin(Star):
                 pages.append({
                     "title": r["title"],
                     "url": r["href"],
-                    "text": text[:5000],
+                    "text": text[:3000],
                 })
         logger.info(f"爬取完成: {len(pages)}/{min(3, len(results))} 页")
 
         # 3. 嵌入/关键词整理相关内容
         if pages:
-            context = _extract_relevant_passages(query, pages, adapter=self._adapter)
+            context = _extract_relevant_passages(query, pages, adapter=self._adapter, max_chars=2000)
         else:
-            # 无全文时用搜索摘要
             context = "\n\n".join(
                 f"[{i+1}] {r['title']}\n{r['body']}"
                 for i, r in enumerate(results[:5])
             )
 
-        # 4. 返回搜索结果（LLM 会自动根据此信息生成回复）
+        # 4. 返回搜索结果给LLM，并指示压缩回复
         yield event.plain_result(
-            f"关于「{query}」的搜索结果：\n\n{context}"
+            f"以下是与「{query}」相关的搜索结果。请用不超过200字的自然对话语气回答用户，不要列出网址或来源：\n\n{context}"
         )
 
     # ── 手动指令 ──────────────────────────
