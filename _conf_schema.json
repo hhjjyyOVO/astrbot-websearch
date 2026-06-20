@@ -1,4 +1,29 @@
 {
+  "search_backend": {
+    "description": "搜索后端优先级",
+    "type": "string",
+    "default": "auto",
+    "enum": ["auto", "exa_first", "bing_baidu"],
+    "hint": "auto=Exa优先→Bing→百度; exa_first=仅Exa; bing_baidu=仅传统抓取"
+  },
+  "use_jina_reader": {
+    "description": "优先使用 Jina Reader 读取网页",
+    "type": "bool",
+    "default": true,
+    "hint": "Jina Reader 提取内容更干净，失败时自动回退到传统抓取"
+  },
+  "enable_v2ex": {
+    "description": "启用 V2EX 社区搜索",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后 LLM 可通过 search_v2ex 工具搜索 V2EX 社区"
+  },
+  "enable_github": {
+    "description": "启用 GitHub 代码搜索",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后 LLM 可通过 search_github 工具搜索 GitHub 仓库"
+  },
   "reply_max_chars": {
     "description": "回复字数上限",
     "type": "int",

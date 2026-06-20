@@ -1,5 +1,5 @@
 name: websearch
 author: hhjjyy
-desc: 百度+Bing搜索+全文爬取+嵌入整理+LLM生成回复
-version: "2.1.0"
+desc: Agent Reach 驱动搜索(Exa+Bing+百度)+Jina Reader网页阅读+V2EX/GitHub/B站+嵌入整理+LLM生成回复
+version: "2.2.0"
 repo: https://github.com/hhjjyyOVO/astrbot-websearch
